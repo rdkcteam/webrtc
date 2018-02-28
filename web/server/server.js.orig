@@ -1,0 +1,160 @@
+const HTTPS_PORT = 8445;
+
+const fs = require('fs');
+const https = require('https');
+const WebSocket = require('ws');
+const WebSocketServer = WebSocket.Server;
+
+// Taken from http://stackoverflow.com/a/105074/515584
+// Strictly speaking, it's not a real UUID, but it gets the job done here
+function uuid() {
+  function s4() {
+    return Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+  }
+  return s4() + s4() + '-' + s4() + '-' + s4() + '-' + s4() + '-' + s4() + s4() + s4();
+}
+
+var SignalServer = (function() {
+  function SignalServer() {
+    this.connected_clients = [];
+    this.http_server = null;
+    this.wss = null;
+  }
+
+  SignalServer.prototype.listen = function(httpServerConfig) {
+    this.http_server = https.createServer(httpServerConfig, handleHttpRequest);
+    this.wss = new WebSockerServer({server: this.http_serve});
+    this.wss.on('connection', onWebSocketConnect);
+  }
+
+  SignalServer.prototype.handleHttpRequest = function(req, res) {
+    if (req.url === '/') {
+      res.writeHead(200, {'Content-Type': 'text/html'});
+      res.end(fs.readFileSync('client/index.html'));
+    }
+    else if (req.url == '/webrtc.js') {
+      res.writeHead(200, {'Content-Type': 'application/javascript'});
+      res.end(fs.readFileSync('client/webrtc.js'));
+    }
+  }
+
+  SignalServer.prototype.onWebSocketMessage = function(msg) {
+  }
+
+  SignalServer.prototype.onWebSocketConnect = function(ws) {
+    console.log("new message");
+    ws.on('message', this.onWebSocketMessage);
+  }
+})();
+
+var open_sessions = [];
+
+// Yes, SSL is required
+const serverConfig = {
+    key: fs.readFileSync('key.pem'),
+    cert: fs.readFileSync('cert.pem'),
+};
+
+function preferH264(sdp) {
+  var h264_index = -1;
+  var tokens = sdp.split("\\r\\n");
+  for (i = 0; i < tokens.length; ++i) {
+    var res = tokens[i].match(/rtpmap:(\d+) H264/); // (\d+) H264/g);
+    // console.log("[" + i + "]:" + tokens[i]);
+    if (res) {
+      h264_index = res[1];
+    }
+  }
+
+  if (h264_index == -1)
+    return sdp;
+
+  for (i = 0; i < tokens.length; ++i) {
+    var res = tokens[i].match(/^m=video/);
+    if (res) {
+      res = tokens[i].match(/(\s+\d+)+$/);
+      if (res) {
+        var s = res[0].trim();
+        var codecs = s.split(" ");
+        var idx = codecs.indexOf(h264_index);
+        if (idx != -1) {
+          codecs.splice(idx, 1);
+          codecs.splice(0, 0, h264_index);
+        }
+
+        var codec_list = "";
+        for (j = 0; j < codecs.length; ++j) {
+          if (j > 0)
+            codec_list += " ";
+          codec_list += codecs[j];
+        }
+
+        var media_entry = tokens[i].replace(s, codec_list);
+        tokens[i] = media_entry;
+      }
+    }
+  }
+
+  var new_sdp = "";
+  for (i = 0; i < tokens.length; ++i) {
+    if (tokens[i].length == 0)
+      continue;
+    if (i > 0)
+      new_sdp += "\\r\\n";
+    new_sdp += tokens[i];
+  }
+
+  return new_sdp;
+}
+
+// ----------------------------------------------------------------------------------------
+
+// Create a server for the client html page
+var handleRequest = function(request, response) {
+    // Render the single client html file for any request the HTTP server receives
+    if(request.url === '/') {
+        response.writeHead(200, {'Content-Type': 'text/html'});
+        response.end(fs.readFileSync('client/index.html'));
+    } else if(request.url === '/webrtc.js') {
+        response.writeHead(200, {'Content-Type': 'application/javascript'});
+        response.end(fs.readFileSync('client/webrtc.js'));
+    }
+};
+
+var httpsServer = https.createServer(serverConfig, handleRequest);
+httpsServer.listen(HTTPS_PORT, '0.0.0.0');
+
+// ----------------------------------------------------------------------------------------
+
+// Create a server for handling websocket calls
+var wss = new WebSocketServer({server: httpsServer});
+
+wss.on('connection', function(ws) {
+  ws.on('message', function(message) {
+    // Broadcast any received message to all clients
+    // console.log("PRE :%s", message);
+    message = preferH264(message);
+
+    var now = new Date();
+    console.log(now.getHours() + ":" + now.getMinutes() + ":" + now.getSeconds() + "." + now.getUTCMilliseconds());
+    console.log("POST:%s", message);
+    // console.log("BROADCAST");
+    wss.broadcast(message);
+  });
+  ws.on('close', function() {
+    console.log("connection closed");
+    var on_close = Object();
+    on_close.payload = "connection_closed";
+    wss.broadcast(JSON.stringify({'data' : on_close}));
+  });
+});
+
+wss.broadcast = function(data) {
+  this.clients.forEach(function(client) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(data);
+      }
+  });
+};
+
+console.log('Server running. Visit https://localhost:' + HTTPS_PORT + ' in Firefox/Chrome (note the HTTPS; there is no HTTP -> HTTPS redirect!)');
